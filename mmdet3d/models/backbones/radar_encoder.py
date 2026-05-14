@@ -15,7 +15,10 @@ from torchvision.utils import save_image
 from mmdet3d.ops import feature_decorator
 from mmcv.cnn.bricks.non_local import NonLocal2d
 
-from flash_attn.flash_attention import FlashMHA
+try:
+    from flash_attn.flash_attention import FlashMHA
+except ImportError:
+    FlashMHA = None
 
 
 __all__ = ["RadarFeatureNet", "RadarEncoder"]
@@ -58,7 +61,7 @@ class RFNLayer(nn.Module):
         super().__init__()
         self.name = "RFNLayer"
         self.last_vfe = last_layer
-        
+
         self.units = out_channels
 
         if norm_cfg is None:
@@ -157,12 +160,12 @@ class RadarFeatureNet(nn.Module):
                 coors[:, 2].to(dtype).unsqueeze(1) * self.vy + self.y_offset
             )
 
-            # print(self.pc_range) [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] 
+            # print(self.pc_range) [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
             # normalize x,y,z to [0, 1]
             features[:, :, 0:1] = (features[:, :, 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
             features[:, :, 1:2] = (features[:, :, 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
             features[:, :, 2:3] = (features[:, :, 2:3] - self.pc_range[2]) / (self.pc_range[5] - self.pc_range[2])
-            
+
             # Combine together feature decorations
             features_ls = [features, f_center]
             features = torch.cat(features_ls, dim=-1)
@@ -190,9 +193,9 @@ class RadarEncoder(nn.Module):
         self,
         pts_voxel_encoder: Dict[str, Any],
         pts_middle_encoder: Dict[str, Any],
-        pts_transformer_encoder=None, 
+        pts_transformer_encoder=None,
         pts_bev_encoder=None,
-        post_scatter=None, 
+        post_scatter=None,
         **kwargs,
     ):
         super().__init__()
@@ -212,11 +215,11 @@ class RadarEncoder(nn.Module):
 
         if self.post_scatter is not None:
             x = self.post_scatter(x, img_features)
-        
+
         if self.pts_bev_encoder is not None:
             x = self.pts_bev_encoder(x)
-        
-    
+
+
         return x
 
     def visualize_pillars(self, feats, coords, sizes):

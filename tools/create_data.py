@@ -12,6 +12,7 @@ def nuscenes_data_prep(
     out_dir,
     max_sweeps=10,
     load_augmented=None,
+    num_workers=4,
 ):
     """Prepare data related to nuScenes dataset.
 
@@ -29,7 +30,8 @@ def nuscenes_data_prep(
     if load_augmented is None:
         # otherwise, infos must have been created, we just skip.
         nuscenes_converter.create_nuscenes_infos(
-            root_path, info_prefix, version=version, max_sweeps=max_sweeps
+            root_path, info_prefix, version=version, max_sweeps=max_sweeps,
+            num_workers=num_workers,
         )
 
         # if version == "v1.0-test":
@@ -48,6 +50,7 @@ def nuscenes_data_prep(
         info_prefix,
         f"{out_dir}/{info_prefix}_infos_train.pkl",
         load_augmented=load_augmented,
+        num_workers=num_workers,
     )
 
 
@@ -106,6 +109,7 @@ if __name__ == "__main__":
             out_dir=args.out_dir,
             max_sweeps=args.max_sweeps,
             load_augmented=load_augmented,
+            num_workers=args.workers,
         )
         test_version = f"{args.version}-test"
         nuscenes_data_prep(
@@ -116,6 +120,7 @@ if __name__ == "__main__":
             out_dir=args.out_dir,
             max_sweeps=args.max_sweeps,
             load_augmented=load_augmented,
+            num_workers=args.workers,
         )
     elif args.dataset == "nuscenes" and args.version == "v1.0-mini":
         train_version = f"{args.version}"
@@ -127,4 +132,5 @@ if __name__ == "__main__":
             out_dir=args.out_dir,
             max_sweeps=args.max_sweeps,
             load_augmented=load_augmented,
+            num_workers=args.workers,
         )

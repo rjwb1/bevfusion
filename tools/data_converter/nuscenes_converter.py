@@ -1,4 +1,5 @@
 import mmcv
+import multiprocessing as mp
 import numpy as np
 import os
 from collections import OrderedDict
@@ -12,6 +13,11 @@ from typing import List, Tuple, Union
 from mmdet3d.core.bbox.box_np_ops import points_cam2img
 from mmdet3d.datasets import NuScenesDataset
 
+# Module-level globals used by worker processes (populated via fork, avoids pickling NuScenes)
+_nusc_worker = None
+_train_scenes_worker = None
+_val_scenes_worker = None
+
 nus_categories = ('car', 'truck', 'trailer', 'bus', 'construction_vehicle',
                   'bicycle', 'motorcycle', 'pedestrian', 'traffic_cone',
                   'barrier')
@@ -22,11 +28,117 @@ nus_attributes = ('cycle.with_rider', 'cycle.without_rider',
                   'vehicle.parked', 'vehicle.stopped', 'None')
 
 
+def _process_one_sample(args):
+    """Worker function: process a single NuScenes sample dict into an info dict."""
+    sample, test, max_sweeps, max_radar_sweeps = args
+    nusc = _nusc_worker
+    train_scenes = _train_scenes_worker
+
+    lidar_token = sample['data']['LIDAR_TOP']
+    sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+    cs_record = nusc.get('calibrated_sensor', sd_rec['calibrated_sensor_token'])
+    pose_record = nusc.get('ego_pose', sd_rec['ego_pose_token'])
+    lidar_path, boxes, _ = nusc.get_sample_data(lidar_token)
+
+    info = {
+        'lidar_path': lidar_path,
+        'token': sample['token'],
+        'sweeps': [],
+        'cams': dict(),
+        'radars': dict(),
+        'lidar2ego_translation': cs_record['translation'],
+        'lidar2ego_rotation': cs_record['rotation'],
+        'ego2global_translation': pose_record['translation'],
+        'ego2global_rotation': pose_record['rotation'],
+        'timestamp': sample['timestamp'],
+        'prev_token': sample['prev'],
+    }
+
+    l2e_r_mat = Quaternion(info['lidar2ego_rotation']).rotation_matrix
+    e2g_r_mat = Quaternion(info['ego2global_rotation']).rotation_matrix
+    l2e_t = info['lidar2ego_translation']
+    e2g_t = info['ego2global_translation']
+
+    camera_types = [
+        'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT',
+        'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT',
+    ]
+    for cam in camera_types:
+        cam_token = sample['data'][cam]
+        cam_path, _, cam_intrinsic = nusc.get_sample_data(cam_token)
+        cam_info = obtain_sensor2top(nusc, cam_token, l2e_t, l2e_r_mat, e2g_t, e2g_r_mat, cam)
+        cam_info.update(cam_intrinsic=cam_intrinsic)
+        info['cams'].update({cam: cam_info})
+
+    radar_names = [
+        'RADAR_FRONT', 'RADAR_FRONT_LEFT', 'RADAR_FRONT_RIGHT',
+        'RADAR_BACK_LEFT', 'RADAR_BACK_RIGHT',
+    ]
+    for radar_name in radar_names:
+        radar_token = sample['data'][radar_name]
+        radar_rec = nusc.get('sample_data', radar_token)
+        sweeps = []
+        while len(sweeps) < max_radar_sweeps:
+            if not radar_rec['prev'] == '':
+                radar_info = obtain_sensor2top(nusc, radar_token, l2e_t, l2e_r_mat, e2g_t, e2g_r_mat, radar_name)
+                sweeps.append(radar_info)
+                radar_token = radar_rec['prev']
+                radar_rec = nusc.get('sample_data', radar_token)
+            else:
+                radar_info = obtain_sensor2top(nusc, radar_token, l2e_t, l2e_r_mat, e2g_t, e2g_r_mat, radar_name)
+                sweeps.append(radar_info)
+                break
+        info['radars'].update({radar_name: sweeps})
+
+    sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+    sweeps = []
+    while len(sweeps) < max_sweeps:
+        if not sd_rec['prev'] == '':
+            sweep = obtain_sensor2top(nusc, sd_rec['prev'], l2e_t, l2e_r_mat, e2g_t, e2g_r_mat, 'lidar')
+            sweeps.append(sweep)
+            sd_rec = nusc.get('sample_data', sd_rec['prev'])
+        else:
+            break
+    info['sweeps'] = sweeps
+
+    if not test:
+        annotations = [nusc.get('sample_annotation', token) for token in sample['anns']]
+        locs = np.array([b.center for b in boxes]).reshape(-1, 3)
+        dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
+        rots = np.array([b.orientation.yaw_pitch_roll[0] for b in boxes]).reshape(-1, 1)
+        velocity = np.array([nusc.box_velocity(token)[:2] for token in sample['anns']])
+        valid_flag = np.array(
+            [(anno['num_lidar_pts'] + anno['num_radar_pts']) > 0 for anno in annotations],
+            dtype=bool,
+        ).reshape(-1)
+        for i in range(len(boxes)):
+            velo = np.array([*velocity[i], 0.0])
+            velo = velo @ np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T
+            velocity[i] = velo[:2]
+        names = [b.name for b in boxes]
+        for i in range(len(names)):
+            if names[i] in NuScenesDataset.NameMapping:
+                names[i] = NuScenesDataset.NameMapping[names[i]]
+        names = np.array(names)
+        gt_boxes = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)
+        assert len(gt_boxes) == len(annotations)
+        info['gt_boxes'] = gt_boxes
+        info['gt_names'] = names
+        info['gt_velocity'] = velocity.reshape(-1, 2)
+        info['num_lidar_pts'] = np.array([a['num_lidar_pts'] for a in annotations])
+        info['num_radar_pts'] = np.array([a['num_radar_pts'] for a in annotations])
+        info['valid_flag'] = valid_flag
+
+    is_train = sample['scene_token'] in train_scenes
+    return info, is_train
+
+
 def create_nuscenes_infos(root_path,
                           info_prefix,
                           version='v1.0-trainval',
-                          max_sweeps=10, 
-                          max_radar_sweeps=10):
+                          max_sweeps=10,
+                          max_radar_sweeps=10,
+                          num_workers=4):
     """Create info file of nuscene dataset.
     Given the raw data, generate its related info file in pkl format.
     Args:
@@ -78,7 +190,9 @@ def create_nuscenes_infos(root_path,
         print('train scene: {}, val scene: {}'.format(
             len(train_scenes), len(val_scenes)))
     train_nusc_infos, val_nusc_infos = _fill_trainval_infos(
-        nusc, train_scenes, val_scenes, test, max_sweeps=max_sweeps, max_radar_sweeps=max_radar_sweeps)
+        nusc, train_scenes, val_scenes, test,
+        max_sweeps=max_sweeps, max_radar_sweeps=max_radar_sweeps,
+        num_workers=num_workers)
 
     metadata = dict(version=version)
     if test:
@@ -143,163 +257,44 @@ def _fill_trainval_infos(nusc,
                          train_scenes,
                          val_scenes,
                          test=False,
-                         max_sweeps=10, 
-                         max_radar_sweeps=10):
-    """Generate the train/val infos from the raw data.
-    Args:
-        nusc (:obj:`NuScenes`): Dataset class in the nuScenes dataset.
-        train_scenes (list[str]): Basic information of training scenes.
-        val_scenes (list[str]): Basic information of validation scenes.
-        test (bool): Whether use the test mode. In the test mode, no
-            annotations can be accessed. Default: False.
-        max_sweeps (int): Max number of sweeps. Default: 10.
-        max_radar_sweeps (int): Max number of radar sweeps. Default: 10.
-    Returns:
-        tuple[list[dict]]: Information of training set and validation set
-            that will be saved to the info file.
-    """
+                         max_sweeps=10,
+                         max_radar_sweeps=10,
+                         num_workers=4):
+    global _nusc_worker, _train_scenes_worker, _val_scenes_worker
+    _nusc_worker = nusc
+    _train_scenes_worker = train_scenes
+    _val_scenes_worker = val_scenes
+
+    task_args = [(s, test, max_sweeps, max_radar_sweeps) for s in nusc.sample]
+
+    if num_workers > 1:
+        # fork copies the globals above into each worker without pickling nusc
+        ctx = mp.get_context('fork')
+        with ctx.Pool(num_workers) as pool:
+            prog = mmcv.ProgressBar(len(task_args))
+            results = []
+            for r in pool.imap(_process_one_sample, task_args, chunksize=16):
+                results.append(r)
+                prog.update()
+            print()
+    else:
+        results = [
+            _process_one_sample(a)
+            for a in mmcv.track_iter_progress(task_args)
+        ]
+
     train_nusc_infos = []
     val_nusc_infos = []
     token2idx = {}
 
-    i_ = 0
-
-    for sample in mmcv.track_iter_progress(nusc.sample):
-        # i_ += 1 
-        # if i_ > 6: 
-        #     break 
-
-        lidar_token = sample['data']['LIDAR_TOP']
-        sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
-        cs_record = nusc.get('calibrated_sensor',
-                             sd_rec['calibrated_sensor_token'])
-        pose_record = nusc.get('ego_pose', sd_rec['ego_pose_token'])
-        lidar_path, boxes, _ = nusc.get_sample_data(lidar_token)
-
-        mmcv.check_file_exist(lidar_path)
-
-        info = {
-            'lidar_path': lidar_path,
-            'token': sample['token'],
-            'sweeps': [],
-            'cams': dict(),
-            'radars': dict(), 
-            'lidar2ego_translation': cs_record['translation'],
-            'lidar2ego_rotation': cs_record['rotation'],
-            'ego2global_translation': pose_record['translation'],
-            'ego2global_rotation': pose_record['rotation'],
-            'timestamp': sample['timestamp'],
-            'prev_token': sample['prev']
-        }
-
-        l2e_r = info['lidar2ego_rotation']
-        l2e_t = info['lidar2ego_translation']
-        e2g_r = info['ego2global_rotation']
-        e2g_t = info['ego2global_translation']
-        l2e_r_mat = Quaternion(l2e_r).rotation_matrix
-        e2g_r_mat = Quaternion(e2g_r).rotation_matrix
-
-        # obtain 6 image's information per frame
-        camera_types = [
-            'CAM_FRONT',
-            'CAM_FRONT_RIGHT',
-            'CAM_FRONT_LEFT',
-            'CAM_BACK',
-            'CAM_BACK_LEFT',
-            'CAM_BACK_RIGHT',
-        ]
-        for cam in camera_types:
-            cam_token = sample['data'][cam]
-            cam_path, _, cam_intrinsic = nusc.get_sample_data(cam_token)
-            cam_info = obtain_sensor2top(nusc, cam_token, l2e_t, l2e_r_mat,
-                                         e2g_t, e2g_r_mat, cam)
-            cam_info.update(cam_intrinsic=cam_intrinsic)
-            info['cams'].update({cam: cam_info})
-
-        radar_names = ['RADAR_FRONT', 'RADAR_FRONT_LEFT', 'RADAR_FRONT_RIGHT',  'RADAR_BACK_LEFT', 'RADAR_BACK_RIGHT']
-
-        for radar_name in radar_names:
-            radar_token = sample['data'][radar_name]
-            radar_rec = nusc.get('sample_data', radar_token)
-            sweeps = []
-
-            while len(sweeps) < max_radar_sweeps:
-                if not radar_rec['prev'] == '':
-                    radar_path, _, radar_intrin = nusc.get_sample_data(radar_token)
-
-                    radar_info = obtain_sensor2top(nusc, radar_token, l2e_t, l2e_r_mat,
-                                                e2g_t, e2g_r_mat, radar_name)
-                    sweeps.append(radar_info)
-                    radar_token = radar_rec['prev']
-                    radar_rec = nusc.get('sample_data', radar_token)
-                else:
-                    radar_path, _, radar_intrin = nusc.get_sample_data(radar_token)
-
-                    radar_info = obtain_sensor2top(nusc, radar_token, l2e_t, l2e_r_mat,
-                                                e2g_t, e2g_r_mat, radar_name)
-                    sweeps.append(radar_info)
-            
-            info['radars'].update({radar_name: sweeps})
-        # obtain sweeps for a single key-frame
-        sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
-        sweeps = []
-        while len(sweeps) < max_sweeps:
-            if not sd_rec['prev'] == '':
-                sweep = obtain_sensor2top(nusc, sd_rec['prev'], l2e_t,
-                                          l2e_r_mat, e2g_t, e2g_r_mat, 'lidar')
-                sweeps.append(sweep)
-                sd_rec = nusc.get('sample_data', sd_rec['prev'])
-            else:
-                break
-        info['sweeps'] = sweeps
-        # obtain annotation
-        if not test:
-            annotations = [
-                nusc.get('sample_annotation', token)
-                for token in sample['anns']
-            ]
-            locs = np.array([b.center for b in boxes]).reshape(-1, 3)
-            dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
-            rots = np.array([b.orientation.yaw_pitch_roll[0]
-                             for b in boxes]).reshape(-1, 1)
-            velocity = np.array(
-                [nusc.box_velocity(token)[:2] for token in sample['anns']])
-            valid_flag = np.array(
-                [(anno['num_lidar_pts'] + anno['num_radar_pts']) > 0
-                 for anno in annotations],
-                dtype=bool).reshape(-1)
-            # convert velo from global to lidar
-            for i in range(len(boxes)):
-                velo = np.array([*velocity[i], 0.0])
-                velo = velo @ np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(
-                    l2e_r_mat).T
-                velocity[i] = velo[:2]
-
-            names = [b.name for b in boxes]
-            for i in range(len(names)):
-                if names[i] in NuScenesDataset.NameMapping:
-                    names[i] = NuScenesDataset.NameMapping[names[i]]
-            names = np.array(names)
-            # we need to convert rot to SECOND format.
-            gt_boxes = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)
-            assert len(gt_boxes) == len(
-                annotations), f'{len(gt_boxes)}, {len(annotations)}'
-            info['gt_boxes'] = gt_boxes
-            info['gt_names'] = names
-            info['gt_velocity'] = velocity.reshape(-1, 2)
-            info['num_lidar_pts'] = np.array(
-                [a['num_lidar_pts'] for a in annotations])
-            info['num_radar_pts'] = np.array(
-                [a['num_radar_pts'] for a in annotations])
-            info['valid_flag'] = valid_flag
-
-        if sample['scene_token'] in train_scenes:
+    for info, is_train in results:
+        if is_train:
             train_nusc_infos.append(info)
             token2idx[info['token']] = ('train', len(train_nusc_infos) - 1)
         else:
             val_nusc_infos.append(info)
             token2idx[info['token']] = ('val', len(val_nusc_infos) - 1)
-    
+
     for info in train_nusc_infos:
         prev_token = info['prev_token']
         if prev_token == '':

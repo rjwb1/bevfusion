@@ -1,0 +1,8 @@
+mpi4py>=3.1.4
+Pillow==8.4.0
+torch>=1.9,<=1.13.1
+tqdm
+torchpack
+mmcv==1.4.0
+mmdet==2.20.0
+nuscenes-devkit

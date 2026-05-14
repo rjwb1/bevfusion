@@ -160,6 +160,16 @@ if __name__ == "__main__":
                 sources_cuda=["src/furthest_point_sample_cuda.cu"],
             ),
             make_cuda_ext(
+                name="feature_decorator_ext",
+                module="mmdet3d.ops.feature_decorator",
+                sources=[
+                    "src/feature_decorator.cpp",
+                ],
+                sources_cuda=[
+                    "src/feature_decorator_cuda.cu",
+                ],
+            ),
+            make_cuda_ext(
                 name="gather_points_ext",
                 module="mmdet3d.ops.gather_points",
                 sources=["src/gather_points_cpu.cpp"],
