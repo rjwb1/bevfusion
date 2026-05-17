@@ -22,6 +22,8 @@ class BBoxBEVL1Cost(object):
         normalized_bboxes_xy = (bboxes[:, :2] - pc_start) / pc_range
         normalized_gt_bboxes_xy = (gt_bboxes[:, :2] - pc_start) / pc_range
         reg_cost = torch.cdist(normalized_bboxes_xy, normalized_gt_bboxes_xy, p=1)
+        # Clamp reg_cost to prevent extreme values that can cause NaN in assignment
+        reg_cost = torch.clamp(reg_cost, min=0.0, max=100.0)
         return reg_cost * self.weight
 
 
@@ -31,6 +33,8 @@ class IoU3DCost(object):
         self.weight = weight
 
     def __call__(self, iou):
+        # Clamp IoU to [0, 1] to ensure valid cost computation
+        iou = torch.clamp(iou, min=0.0, max=1.0)
         iou_cost = - iou
         return iou_cost * self.weight
 
@@ -118,6 +122,11 @@ class HungarianAssigner3D(BaseAssigner):
 
         # weighted sum of above three costs
         cost = cls_cost + reg_cost + iou_cost
+
+        # Clamp cost to finite values to handle NaN/Inf from numerical instability
+        # This can happen when boxes are malformed or predictions are extreme
+        cost = torch.nan_to_num(cost, nan=1e10, posinf=1e10, neginf=-1e10)
+        cost = torch.clamp(cost, min=-1e10, max=1e10)
 
         # 3. do Hungarian matching on CPU using linear_sum_assignment
         cost = cost.detach().cpu()

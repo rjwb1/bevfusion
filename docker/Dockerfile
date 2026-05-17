@@ -16,8 +16,11 @@ RUN conda install -y pytorch==1.10.1 torchvision==0.11.2 torchaudio==0.10.1 cuda
 RUN pip install Pillow==8.4.0
 RUN pip install tqdm
 RUN pip install torchpack
-RUN pip install mmcv==1.4.0 mmcv-full==1.4.0 mmdet==2.20.0
+RUN pip install mmcv-full==1.4.0 -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10/index.html
+RUN pip install mmdet==2.20.0
 RUN pip install nuscenes-devkit
 RUN pip install mpi4py==3.0.3
 RUN pip install numba==0.53.0 numpy==1.23.5
-RUN chmod -R a+w /opt/conda/lib/python3.8/site-packages
+RUN pip install 'yapf<0.40.0'
+RUN pip install 'setuptools==59.5.0'
+RUN chmod a+w /opt/conda/lib/python3.8/site-packages
