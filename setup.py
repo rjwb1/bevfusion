@@ -2,7 +2,41 @@ import os
 
 import torch
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
+from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
+
+
+def _detect_cuda_version():
+    """Return (major, minor) of the nvcc that will actually be used, or None."""
+    if CUDA_HOME is None:
+        return None
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            [os.path.join(CUDA_HOME, "bin", "nvcc"), "--version"]
+        ).decode()
+        # e.g. "Cuda compilation tools, release 11.8, V11.8.89"
+        import re
+        m = re.search(r"release (\d+)\.(\d+)", out)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return None
+
+
+def _default_gencode_args():
+    """Pick gencodes the installed nvcc actually supports.
+
+    sm_86 needs CUDA >= 11.1, sm_89/sm_90 need CUDA >= 11.8.
+    """
+    archs = [(70, "sm_70"), (75, "sm_75"), (80, "sm_80")]
+    cuda = _detect_cuda_version()
+    if cuda is None or cuda >= (11, 1):
+        archs.append((86, "sm_86"))
+    if cuda is not None and cuda >= (11, 8):
+        archs.append((89, "sm_89"))
+        archs.append((90, "sm_90"))
+    return [f"-gencode=arch=compute_{n},code={code}" for n, code in archs]
 
 
 def make_cuda_ext(
@@ -15,15 +49,18 @@ def make_cuda_ext(
     if torch.cuda.is_available() or os.getenv("FORCE_CUDA", "0") == "1":
         define_macros += [("WITH_CUDA", None)]
         extension = CUDAExtension
-        extra_compile_args["nvcc"] = extra_args + [
+        # Architecture list can be overridden by the standard TORCH_CUDA_ARCH_LIST
+        # env var. Defaults below cover Volta (V100), Turing (T4/RTX 20xx),
+        # Ampere (A100/RTX 30xx), Ada (RTX 40xx) and Hopper (H100); the gencode
+        # set is filtered to what the installed nvcc actually supports.
+        nvcc_args = [
             "-D__CUDA_NO_HALF_OPERATORS__",
             "-D__CUDA_NO_HALF_CONVERSIONS__",
             "-D__CUDA_NO_HALF2_OPERATORS__",
-            "-gencode=arch=compute_70,code=sm_70",
-            "-gencode=arch=compute_75,code=sm_75",
-            "-gencode=arch=compute_80,code=sm_80",
-            "-gencode=arch=compute_86,code=sm_86",
         ]
+        if os.getenv("TORCH_CUDA_ARCH_LIST") is None:
+            nvcc_args += _default_gencode_args()
+        extra_compile_args["nvcc"] = extra_args + nvcc_args
         sources += sources_cuda
     else:
         print("Compiling {} without CUDA".format(name))
@@ -49,9 +86,11 @@ if __name__ == "__main__":
             "License :: OSI Approved :: Apache Software License",
             "Operating System :: OS Independent",
             "Programming Language :: Python :: 3",
-            "Programming Language :: Python :: 3.6",
-            "Programming Language :: Python :: 3.7",
+            "Programming Language :: Python :: 3.8",
+            "Programming Language :: Python :: 3.9",
+            "Programming Language :: Python :: 3.10",
         ],
+        python_requires=">=3.8",
         license="Apache License 2.0",
         ext_modules=[
             make_cuda_ext(
@@ -73,7 +112,7 @@ if __name__ == "__main__":
                     "src/maxpool.cc",
                     "src/maxpool_cuda.cu",
                 ],
-                extra_args=["-w", "-std=c++14"],
+                extra_args=["-w", "-std=c++17"],
             ),
             make_cuda_ext(
                 name="bev_pool_ext",

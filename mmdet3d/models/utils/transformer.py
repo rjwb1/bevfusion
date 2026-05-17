@@ -382,15 +382,18 @@ def multi_head_attention_forward(query,  # type: Tensor
                 _b = _b[_start:]
             v = F.linear(value, _w, _b)
     else:
-        q_proj_weight_non_opt = torch.jit._unwrap_optional(q_proj_weight)
+        assert q_proj_weight is not None
+        q_proj_weight_non_opt = q_proj_weight
         len1, len2 = q_proj_weight_non_opt.size()
         assert len1 == embed_dim and len2 == query.size(-1)
 
-        k_proj_weight_non_opt = torch.jit._unwrap_optional(k_proj_weight)
+        assert k_proj_weight is not None
+        k_proj_weight_non_opt = k_proj_weight
         len1, len2 = k_proj_weight_non_opt.size()
         assert len1 == embed_dim and len2 == key.size(-1)
 
-        v_proj_weight_non_opt = torch.jit._unwrap_optional(v_proj_weight)
+        assert v_proj_weight is not None
+        v_proj_weight_non_opt = v_proj_weight
         len1, len2 = v_proj_weight_non_opt.size()
         assert len1 == embed_dim and len2 == value.size(-1)
 

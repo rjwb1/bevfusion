@@ -10,5 +10,7 @@ docker run -it \
   -v /home/rob/nuscenes:/workspace/data/nuscenes \
   --shm-size 16g \
   -w /workspace \
-  bevfusion \
-  bash -c "FORCE_CUDA=1 python setup.py build_ext --inplace && bash"
+  bevfusion:torch2 \
+  bash -c "FORCE_CUDA=1 python setup.py build_ext --inplace && torchpack dist-run -np 1 python tools/test.py configs/nuscenes/det/transfusion/secfpn/camera+lidar/resnet50/convfuser.yaml pretrained/bevfusion-det.pth --eval bbox"
+
+#torchpack dist-run -np 1 python tools/test.py configs/nuscenes/det/transfusion/secfpn/camera+lidar/resnet50/convfuser.yaml pretrained/bevfusion-det.pth --eval bbox

@@ -1,0 +1,121 @@
+FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
+
+RUN apt-get update && apt-get install -y wget build-essential g++ gcc git \
+    libgl1-mesa-glx libglib2.0-0 libgtk2.0-dev \
+    openmpi-bin openmpi-common libopenmpi-dev \
+    && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install miniconda with Python 3.10 (matches PyTorch 2.1 wheels)
+ENV CONDA_DIR=/opt/conda
+RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-py310_23.11.0-2-Linux-x86_64.sh -O ~/miniconda.sh && \
+     /bin/bash ~/miniconda.sh -b -p /opt/conda && rm ~/miniconda.sh
+ENV PATH=$CONDA_DIR/bin:$PATH
+
+# Use apt's OpenMPI (which provides mpirun with --allow-run-as-root and the
+# -mca flags torchpack hard-codes) and build mpi4py against it. The bundled
+# `compiler_compat/ld` linker shim in conda cannot resolve apt's openmpi
+# symbols, so we move it aside while building mpi4py and restore PATH
+# afterwards. Modern setuptools also breaks mpi4py 3.x's distutils calls,
+# so we use mpi4py 4.x with Cython 3 pre-installed and build isolation off.
+RUN pip install --no-cache-dir 'setuptools<70.0.0' wheel 'Cython>=3.0.0'
+RUN mv /opt/conda/compiler_compat/ld /opt/conda/compiler_compat/ld.disabled && \
+    MPICC=/usr/bin/mpicc CC=/usr/bin/gcc \
+    pip install --no-cache-dir --no-build-isolation --no-binary=mpi4py mpi4py==4.0.1 && \
+    mv /opt/conda/compiler_compat/ld.disabled /opt/conda/compiler_compat/ld && \
+    python -c "from mpi4py import MPI; print('mpi4py ok, MPI:', MPI.Get_library_version().splitlines()[0])"
+
+# Pin numpy < 2 BEFORE installing torch/mmcv. Otherwise pip pulls numpy 2.x
+# in to satisfy torch's `numpy` requirement, and downstream packages compiled
+# against numpy 1.x abort with the "compiled with NumPy 1.x cannot be run in
+# NumPy 2.x" error.
+RUN pip install --no-cache-dir 'numpy<2'
+
+# PyTorch 2.1 + CUDA 11.8
+RUN pip install --no-cache-dir torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+# mmcv 1.7.x is the last 1.x release line; it ships wheels built against torch 2.1
+RUN pip install --no-cache-dir mmcv-full==1.7.2 \
+    -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1/index.html
+
+# mmdet 2.28 is the last 2.x release; works with mmcv 1.7
+RUN pip install --no-cache-dir mmdet==2.28.2
+
+# mmcv 1.7.2 references PyTorch DDP's _use_replicated_tensor_module attr,
+# which was experimental in 1.13 and removed in 2.x. Replace the ternary
+# with the always-module branch so DDP forward works on PyTorch 2. The
+# pattern allows backslash line-continuations between tokens since mmcv's
+# source uses one.
+RUN python - <<'PY'
+import re, pathlib
+import mmcv.parallel.distributed as ddp_mod
+import mmcv.parallel._functions as fn_mod
+
+# Patch 1: distributed.py — drop the _use_replicated_tensor_module ternary.
+p = pathlib.Path(ddp_mod.__file__)
+src = p.read_text()
+pattern = re.compile(
+    r"self\._replicated_tensor_module"
+    r"[\s\\]+if[\s\\]+self\._use_replicated_tensor_module"
+    r"[\s\\]+else[\s\\]+self\.module",
+)
+new, n = pattern.subn("self.module", src)
+if n == 0:
+    new, n = re.subn(r"self\._use_replicated_tensor_module", "False", src)
+if n == 0:
+    raise SystemExit("mmcv DDP patch: ternary not found")
+p.write_text(new)
+print(f"Patched {p} ({n} substitution(s))")
+
+# Patch 2: _functions.py — PyTorch 2's _get_stream takes a torch.device,
+# not an int. Wrap each entry in target_gpus before the call.
+p = pathlib.Path(fn_mod.__file__)
+src = p.read_text()
+pattern = re.compile(
+    r"streams\s*=\s*\[_get_stream\(device\)\s+for\s+device\s+in\s+target_gpus\]"
+)
+replacement = (
+    "streams = [_get_stream(torch.device('cuda', device) "
+    "if isinstance(device, int) else device) for device in target_gpus]"
+)
+new, n = pattern.subn(replacement, src)
+if n == 0:
+    raise SystemExit("mmcv _get_stream patch: pattern not found")
+# Ensure torch is imported at module scope (it usually already is).
+if "import torch" not in new.splitlines()[0:30]:
+    new = "import torch\n" + new
+p.write_text(new)
+print(f"Patched {p} ({n} substitution(s))")
+PY
+
+# Other deps
+# shapely is pinned below 2.0: the version of nuscenes-devkit used here
+# still iterates over MultiLineString directly (shapely 1.x behaviour);
+# shapely 2.x requires `.geoms` and raises TypeError otherwise.
+RUN pip install --no-cache-dir \
+    Pillow==10.2.0 \
+    tqdm \
+    torchpack \
+    nuscenes-devkit \
+    'shapely<2' \
+    numba==0.58.1 \
+    numpy==1.24.4 \
+    'yapf<0.40.0' \
+    scipy
+
+# Required so users can rebuild extensions from inside the container
+RUN chmod a+w /opt/conda/lib/python3.10/site-packages
+
+# Target most modern Ampere/Ada/Hopper GPUs by default. Override at build time
+# if you only have one architecture (faster compiles).
+ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
+ENV FORCE_CUDA=1
+
+# Ubuntu's OpenMPI pulls in libfabric, which aborts when a process forks
+# children (PyTorch DataLoader workers do this). RDMAV_FORK_SAFE=1 tells
+# libfabric to handle fork safely. FI_PROVIDER=^efa,verbs disables the
+# Amazon EFA / RDMA providers that don't apply on a workstation. Together
+# these avoid the "could result in memory corruption" abort.
+ENV RDMAV_FORK_SAFE=1
+ENV FI_PROVIDER="^efa,verbs"

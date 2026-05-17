@@ -1,0 +1,26 @@
+# PyTorch 2 environment for BEVFusion.
+# Install PyTorch first from the official index (CUDA build varies):
+#   pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118
+# Then install the rest of the requirements:
+#   pip install -r requirements.txt
+
+# OpenMMLab stack pinned to versions that work with PyTorch 2.1
+mmcv-full==1.7.2
+mmdet==2.28.2
+
+# Core deps
+torchpack
+nuscenes-devkit
+# nuscenes-devkit uses shapely 1.x APIs (MultiLineString iteration) that
+# break under shapely 2.x with `MultiLineString is not iterable`.
+shapely<2
+numba>=0.58.0
+numpy>=1.24,<2.0
+scipy
+Pillow>=10.0.0
+tqdm
+mpi4py>=4.0.0
+
+# Build deps
+setuptools<70.0.0
+yapf<0.40.0
