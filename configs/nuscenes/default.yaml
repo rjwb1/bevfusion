@@ -1,5 +1,5 @@
 dataset_type: NuScenesDataset
-dataset_root: data/nuscenes/
+dataset_root: /home/rob/nuscenes/
 gt_paste_stop_epoch: -1
 reduce_beams: 32
 load_dim: 5
@@ -84,7 +84,7 @@ train_pipeline:
       dataset_root: ${dataset_root}
       info_path: ${dataset_root + "nuscenes_dbinfos_train.pkl"}
       rate: 1.0
-      prepare: 
+      prepare:
         filter_by_difficulty: [-1]
         filter_by_min_points:
           car: 5
@@ -150,7 +150,7 @@ train_pipeline:
     type: ImageNormalize
     mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
-  - 
+  -
     type: GridMask
     use_h: true
     use_w: true
@@ -258,7 +258,7 @@ test_pipeline:
       - lidar_aug_matrix
 
 data:
-  samples_per_gpu: 4
+  samples_per_gpu: 2
   workers_per_gpu: 4
   train:
     type: CBGSDataset
@@ -297,4 +297,4 @@ data:
 evaluation:
   interval: 1
   pipeline: ${test_pipeline}
- 
+

@@ -120,7 +120,7 @@ model:
 
 optimizer:
   type: AdamW
-  lr: 1.0e-4
+  lr: 2.5e-5
   weight_decay: 0.01
 
 optimizer_config:
@@ -131,8 +131,8 @@ optimizer_config:
 lr_config:
   policy: CosineAnnealing
   warmup: linear
-  warmup_iters: 1000
-  warmup_ratio: 0.1
+  warmup_iters: 2000
+  warmup_ratio: 0.333
   min_lr_ratio: 1.0e-3
 
 max_epochs: 6

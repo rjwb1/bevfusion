@@ -2,8 +2,9 @@ seed: 0
 deterministic: false
 
 checkpoint_config:
-  interval: 1
-  max_keep_ckpts: 1
+  by_epoch: false
+  interval: 2000
+  max_keep_ckpts: 3
 
 log_config:
   interval: 50
@@ -18,7 +19,7 @@ resume_from: null
 
 cudnn_benchmark: false
 fp16:
-  loss_scale: 
+  loss_scale:
     growth_interval: 2000
 
 max_epochs: 20
