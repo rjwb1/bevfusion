@@ -22,6 +22,7 @@ import torch
 
 CAMERA_PREFIX = "encoders.camera."
 MAP_HEAD_PREFIX = "heads.map."
+DECODER_PREFIX = "decoder."
 
 
 def state(ckpt):
@@ -50,8 +51,14 @@ def main():
                         help="Source for encoders.camera.* keys. Defaults to --det.")
     parser.add_argument("--no-camera", action="store_true",
                         help="Skip the camera branch entirely (rely on init_weights at train time).")
+    parser.add_argument("--multi-decoder", nargs="+", default=["object", "map"],
+                        help="Task names to fan decoder.* keys into (e.g. object map). "
+                             "Pass --multi-decoder '' to keep a single shared decoder.")
     parser.add_argument("--out", default="pretrained/bevfusion-det+seg-merged.pth")
     args = parser.parse_args()
+
+    # Normalize: an empty string or [""] means "single decoder, no fan-out".
+    multi_decoder_tasks = [t for t in args.multi_decoder if t]
 
     det_sd = state(torch.load(args.det, map_location="cpu"))
     seg_sd = state(torch.load(args.seg, map_location="cpu"))
@@ -64,11 +71,28 @@ def main():
 
     merged = {}
 
-    # Base: everything from det except camera (will be re-added below) and map head.
+    # Base: everything from det except camera (will be re-added below), map head,
+    # and the decoder (handled separately so we can fan it out if requested).
     for k, v in det_sd.items():
-        if k.startswith(CAMERA_PREFIX) or k.startswith(MAP_HEAD_PREFIX):
+        if (
+            k.startswith(CAMERA_PREFIX)
+            or k.startswith(MAP_HEAD_PREFIX)
+            or k.startswith(DECODER_PREFIX)
+        ):
             continue
         merged[k] = v
+
+    # Decoder: either copied straight through, or fanned out per task.
+    decoder_keys = [k for k in det_sd if k.startswith(DECODER_PREFIX)]
+    if multi_decoder_tasks:
+        for task in multi_decoder_tasks:
+            for k in decoder_keys:
+                # decoder.backbone.X -> decoder.<task>.backbone.X
+                new_key = f"{DECODER_PREFIX}{task}.{k[len(DECODER_PREFIX):]}"
+                merged[new_key] = det_sd[k]
+    else:
+        for k in decoder_keys:
+            merged[k] = det_sd[k]
 
     # Map head from seg.
     map_keys = [k for k in seg_sd if k.startswith(MAP_HEAD_PREFIX)]
@@ -88,6 +112,13 @@ def main():
         print(f"camera: {camera_src} ({len(camera_keys)} camera keys)")
     else:
         print("camera: SKIPPED (--no-camera)")
+    if multi_decoder_tasks:
+        print(
+            f"decoder: fanned {len(decoder_keys)} keys -> "
+            f"{len(multi_decoder_tasks) * len(decoder_keys)} ({', '.join(multi_decoder_tasks)})"
+        )
+    else:
+        print(f"decoder: shared ({len(decoder_keys)} keys)")
     print()
     summarize(merged, f"merged -> {args.out}")
 

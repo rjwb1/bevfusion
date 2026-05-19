@@ -60,16 +60,39 @@ class BEVFusion(Base3DFusionModel):
         else:
             self.fuser = None
 
-        self.decoder = nn.ModuleDict(
-            {
-                "backbone": build_backbone(decoder["backbone"]),
-                "neck": build_neck(decoder["neck"]),
-            }
-        )
+        # Decoder may be either single (shared "backbone"/"neck" keys) or
+        # per-task (one entry per head name, each with "backbone"/"neck").
+        self.multi_decoder = "backbone" not in decoder
+        if self.multi_decoder:
+            self.decoder = nn.ModuleDict(
+                {
+                    task: nn.ModuleDict(
+                        {
+                            "backbone": build_backbone(decoder[task]["backbone"]),
+                            "neck": build_neck(decoder[task]["neck"]),
+                        }
+                    )
+                    for task in decoder
+                }
+            )
+        else:
+            self.decoder = nn.ModuleDict(
+                {
+                    "backbone": build_backbone(decoder["backbone"]),
+                    "neck": build_neck(decoder["neck"]),
+                }
+            )
         self.heads = nn.ModuleDict()
         for name in heads:
             if heads[name] is not None:
                 self.heads[name] = build_head(heads[name])
+
+        if self.multi_decoder:
+            missing = [name for name in self.heads if name not in self.decoder]
+            if missing:
+                raise ValueError(
+                    f"multi_decoder enabled but no decoder branch for head(s): {missing}"
+                )
 
         if "loss_scale" in kwargs:
             self.loss_scale = kwargs["loss_scale"]
@@ -258,17 +281,26 @@ class BEVFusion(Base3DFusionModel):
 
         batch_size = x.shape[0]
 
-        x = self.decoder["backbone"](x)
-        x = self.decoder["neck"](x)
+        if self.multi_decoder:
+            task_feats = {}
+            for task, dec in self.decoder.items():
+                f = dec["backbone"](x)
+                f = dec["neck"](f)
+                task_feats[task] = f
+        else:
+            shared = self.decoder["backbone"](x)
+            shared = self.decoder["neck"](shared)
+            task_feats = {task: shared for task in self.heads}
 
         if self.training:
             outputs = {}
             for type, head in self.heads.items():
+                feat = task_feats[type]
                 if type == "object":
-                    pred_dict = head(x, metas)
+                    pred_dict = head(feat, metas)
                     losses = head.loss(gt_bboxes_3d, gt_labels_3d, pred_dict)
                 elif type == "map":
-                    losses = head(x, gt_masks_bev)
+                    losses = head(feat, gt_masks_bev)
                 else:
                     raise ValueError(f"unsupported head: {type}")
                 for name, val in losses.items():
@@ -280,8 +312,9 @@ class BEVFusion(Base3DFusionModel):
         else:
             outputs = [{} for _ in range(batch_size)]
             for type, head in self.heads.items():
+                feat = task_feats[type]
                 if type == "object":
-                    pred_dict = head(x, metas)
+                    pred_dict = head(feat, metas)
                     bboxes = head.get_bboxes(pred_dict, metas)
                     for k, (boxes, scores, labels) in enumerate(bboxes):
                         outputs[k].update(
@@ -292,7 +325,7 @@ class BEVFusion(Base3DFusionModel):
                             }
                         )
                 elif type == "map":
-                    logits = head(x)
+                    logits = head(feat)
                     for k in range(batch_size):
                         outputs[k].update(
                             {
