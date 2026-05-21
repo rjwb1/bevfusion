@@ -50,7 +50,11 @@ def main():
     logger = get_root_logger(log_file=log_file)
 
     # log some basic info
-    logger.info(f"Config:\n{cfg.pretty_text}")
+    try:
+        config_text = cfg.pretty_text
+    except Exception:
+        config_text = cfg.text
+    logger.info(f"Config:\n{config_text}")
 
     # set random seeds
     if cfg.seed is not None:

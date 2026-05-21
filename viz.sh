@@ -1,0 +1,1 @@
+bash scripts/run_local.sh visualize configs/nuscenes/det+seg-multi/resnet50-convfuser.yaml --checkpoint runs/det-seg-multidecoder/latest.pth

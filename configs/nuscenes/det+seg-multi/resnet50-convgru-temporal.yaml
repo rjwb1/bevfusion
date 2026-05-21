@@ -1,0 +1,207 @@
+# Temporal ConvGRU fusion config.
+#
+# Inherits decoder/heads/optimizer from det+seg-multi/default.yaml and the
+# dataset/pipeline scaffolding from nuscenes/default.yaml, then:
+#   * swaps ConvFuser -> ConvGRUFuser (batch dim == time, BPTT over a clip),
+#   * replaces the CBGS train set with TemporalNuScenesDataset (ordered clips),
+#   * neutralises 3D global rot/scale/flip so BEV content stays geometrically
+#     consistent across the frames of a clip (camera image-space aug is kept --
+#     it is compensated by img_aug_matrix and does not desync the BEV),
+#   * disables ObjectPaste (gt_paste) so pasted objects don't pop in/out,
+#   * initialises from the trained ConvFuser checkpoint (load_from), so the
+#     LR schedule restarts fresh (not a resume).
+#
+# Each training batch is one clip of `clip_length` consecutive keyframes from a
+# single scene; the model fuses them recurrently and is supervised on every
+# frame. See tools/convert_convfuser_to_convgru.py for the init checkpoint.
+
+clip_length: 3
+
+# Disable gt-paste from epoch 0 (keeps clips temporally coherent).
+gt_paste_stop_epoch: 0
+
+model:
+  encoders:
+    camera:
+      backbone:
+        type: ResNet
+        depth: 50
+        out_indices: [1, 2, 3]
+        init_cfg:
+          type: Pretrained
+          checkpoint: https://download.pytorch.org/models/resnet50-0676ba61.pth
+      neck:
+        type: GeneralizedLSSFPN
+        in_channels: [512, 1024, 2048]
+        out_channels: 256
+        start_level: 0
+        num_outs: 3
+        norm_cfg:
+          type: BN2d
+          requires_grad: true
+        act_cfg:
+          type: ReLU
+          inplace: true
+        upsample_cfg:
+          mode: bilinear
+          align_corners: false
+      vtransform:
+        type: DepthLSSTransform
+        in_channels: 256
+        out_channels: 80
+        image_size: ${image_size}
+        feature_size: ${[image_size[0] // 8, image_size[1] // 8]}
+        xbound: [-54.0, 54.0, 0.3]
+        ybound: [-54.0, 54.0, 0.3]
+        zbound: [-10.0, 10.0, 20.0]
+        dbound: [1.0, 60.0, 0.5]
+        downsample: 2
+    lidar:
+      voxelize:
+        max_num_points: 10
+        point_cloud_range: ${point_cloud_range}
+        voxel_size: ${voxel_size}
+        max_voxels: [40000, 60000]
+      backbone:
+        type: SparseEncoder
+        in_channels: 5
+        sparse_shape: [1440, 1440, 41]
+        output_channels: 128
+        order:
+          - conv
+          - norm
+          - act
+        encoder_channels:
+          - [16, 16, 32]
+          - [32, 32, 64]
+          - [64, 64, 128]
+          - [128, 128]
+        encoder_paddings:
+          - [0, 0, 1]
+          - [0, 0, 1]
+          - [0, 0, [1, 1, 0]]
+          - [0, 0]
+        block_type: basicblock
+  fuser:
+    type: ConvGRUFuser
+    in_channels: [80, 256]
+    out_channels: 256
+
+# Geometry-stable training pipeline (no 3D global aug, no gt-paste, no flip).
+train_pipeline:
+  -
+    type: LoadMultiViewImageFromFiles
+    to_float32: true
+  -
+    type: LoadPointsFromFile
+    coord_type: LIDAR
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    load_augmented: ${load_augmented}
+  -
+    type: LoadPointsFromMultiSweeps
+    sweeps_num: 9
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    pad_empty_sweeps: true
+    remove_close: true
+    load_augmented: ${load_augmented}
+  -
+    type: LoadAnnotations3D
+    with_bbox_3d: true
+    with_label_3d: true
+    with_attr_label: False
+  -
+    type: ImageAug3D
+    final_dim: ${image_size}
+    resize_lim: ${augment2d.resize[0]}
+    bot_pct_lim: [0.0, 0.0]
+    rot_lim: ${augment2d.rotate}
+    rand_flip: true
+    is_train: true
+  -
+    type: GlobalRotScaleTrans
+    resize_lim: [1.0, 1.0]
+    rot_lim: [0.0, 0.0]
+    trans_lim: 0.0
+    is_train: false
+  -
+    type: LoadBEVSegmentation
+    dataset_root: ${dataset_root}
+    xbound: [-50.0, 50.0, 0.5]
+    ybound: [-50.0, 50.0, 0.5]
+    classes: ${map_classes}
+  -
+    type: PointsRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ObjectRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ObjectNameFilter
+    classes: ${object_classes}
+  -
+    type: ImageNormalize
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  -
+    type: GridMask
+    use_h: true
+    use_w: true
+    max_epoch: ${max_epochs}
+    rotate: 1
+    offset: false
+    ratio: 0.5
+    mode: 1
+    prob: ${augment2d.gridmask.prob}
+    fixed_prob: ${augment2d.gridmask.fixed_prob}
+  -
+    type: PointShuffle
+  -
+    type: DefaultFormatBundle3D
+    classes: ${object_classes}
+  -
+    type: Collect3D
+    keys:
+      - img
+      - points
+      - gt_bboxes_3d
+      - gt_labels_3d
+      - gt_masks_bev
+    meta_keys:
+      - camera_intrinsics
+      - camera2ego
+      - lidar2ego
+      - lidar2camera
+      - camera2lidar
+      - lidar2image
+      - img_aug_matrix
+      - lidar_aug_matrix
+
+data:
+  samples_per_gpu: 1
+  workers_per_gpu: 4
+  train:
+    type: TemporalNuScenesDataset
+    dataset_root: ${dataset_root}
+    ann_file: ${dataset_root + "nuscenes_infos_train.pkl"}
+    pipeline: ${train_pipeline}
+    object_classes: ${object_classes}
+    map_classes: ${map_classes}
+    modality: ${input_modality}
+    test_mode: false
+    use_valid_flag: true
+    box_type_3d: LiDAR
+    clip_length: ${clip_length}
+    clip_stride: 1
+  val:
+    type: TemporalNuScenesDataset
+    clip_length: ${clip_length}
+  test:
+    type: TemporalNuScenesDataset
+    clip_length: ${clip_length}
+
+# Start from the trained ConvFuser model (fresh LR schedule, not a resume).
+load_from: runs/det-seg-multidecoder/convgru_init.pth
