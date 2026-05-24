@@ -1,6 +1,7 @@
 import os
 from typing import Any, Dict, Tuple
 
+import cv2
 import mmcv
 import numpy as np
 from nuscenes.map_expansion.map_api import NuScenesMap
@@ -556,3 +557,153 @@ class LoadAnnotations3D(LoadAnnotations):
             results = self._load_attr_labels(results)
 
         return results
+
+
+@PIPELINES.register_module()
+class LoadBEVSegmentationFromGeometry:
+    """BEV-segmentation GT for synthetic (SDG) data, rasterised from vector
+    geometry instead of the nuScenes map API.
+
+    Mirrors ``LoadBEVSegmentation`` exactly in output convention so it is a
+    drop-in replacement, but reads per-sample geometry placed in the input dict
+    by ``NuScenesSDGDataset`` (ego/LiDAR frame, since the SDG lidar is exported
+    in the ego frame so ``lidar2ego`` is identity):
+
+        * ``data["bev_rows"]``      -> (R, 2, 2) float32 line segments (vine rows)
+        * ``data["bev_obstacles"]`` -> (K, 4, 2) float32 polygon footprints
+
+    Both are in the (un-augmented) ego frame; this transform applies
+    ``lidar_aug_matrix`` (lidar -> network/"point" frame) before rasterising, so
+    the mask stays aligned with the augmented points/boxes - identical to how the
+    original derives ``lidar2global`` from ``point2lidar``. It must therefore sit
+    at the same pipeline position (after GlobalRotScaleTrans, before
+    RandomFlip3D, which flips ``gt_masks_bev`` for us).
+
+    Pixel convention (matches LoadBEVSegmentation after its transpose(0,2,1) on a
+    square canvas): axis 1 = x (forward), axis 2 = y (left), no flips:
+        row = (x - xbound[0]) / xbound[2];  col = (y - ybound[0]) / ybound[2]
+
+    ``classes`` must be ("rows", "obstacles") (order = channel order).
+    """
+
+    def __init__(
+        self,
+        xbound: Tuple[float, float, float],
+        ybound: Tuple[float, float, float],
+        classes: Tuple[str, ...],
+        row_width: float = 0.4,
+    ) -> None:
+        super().__init__()
+        self.xbound = xbound
+        self.ybound = ybound
+        self.classes = list(classes)
+        self.row_width = row_width
+        # canvas: axis 1 = x cells, axis 2 = y cells
+        self.nx = int(round((xbound[1] - xbound[0]) / xbound[2]))
+        self.ny = int(round((ybound[1] - ybound[0]) / ybound[2]))
+        # row line thickness in pixels (>=1)
+        self.row_px = max(1, int(round(row_width / ((xbound[2] + ybound[2]) / 2.0))))
+
+    def _to_pixels(self, pts_ego: np.ndarray, aug: np.ndarray) -> np.ndarray:
+        """(N,2) ego-frame xy -> (N,2) int (col=y_idx, row=x_idx) for cv2."""
+        if pts_ego.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        R = aug[:2, :2]
+        t = aug[:2, 3]
+        net = pts_ego @ R.T + t  # lidar/ego -> augmented network frame
+        col = (net[:, 1] - self.ybound[0]) / self.ybound[2]  # y -> col
+        row = (net[:, 0] - self.xbound[0]) / self.xbound[2]  # x -> row
+        return np.stack([col, row], axis=1).astype(np.int32)  # cv2 wants (x=col, y=row)
+
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        aug = data.get("lidar_aug_matrix", np.eye(4, dtype=np.float32))
+        # cv2 image is (rows=nx, cols=ny); we draw with points (col, row).
+        labels = np.zeros((len(self.classes), self.nx, self.ny), dtype=np.int64)
+
+        def channel(name):
+            return self.classes.index(name) if name in self.classes else None
+
+        rows_c = channel("rows")
+        if rows_c is not None:
+            rows = data.get("bev_rows", None)
+            if rows is not None and len(rows) > 0:
+                canvas = np.zeros((self.nx, self.ny), dtype=np.uint8)
+                for seg in np.asarray(rows, dtype=np.float32):
+                    px = self._to_pixels(seg, aug)  # (2,2)
+                    cv2.polylines(canvas, [px], False, 1, self.row_px)
+                labels[rows_c][canvas.astype(bool)] = 1
+
+        obs_c = channel("obstacles")
+        if obs_c is not None:
+            obs = data.get("bev_obstacles", None)
+            if obs is not None and len(obs) > 0:
+                canvas = np.zeros((self.nx, self.ny), dtype=np.uint8)
+                polys = [self._to_pixels(np.asarray(p, dtype=np.float32), aug)
+                         for p in obs]
+                cv2.fillPoly(canvas, polys, 1)
+                labels[obs_c][canvas.astype(bool)] = 1
+
+        data["gt_masks_bev"] = labels
+        return data
+
+
+@PIPELINES.register_module()
+class LoadLinesFromGeometry:
+    """Vector-line GT for the BEV line head (SDG synthetic data).
+
+    Reads per-sample line geometry that ``LoadBEVSegmentationFromGeometry`` would
+    otherwise rasterise - ``data[geometry_key]`` of shape (L, 2, 2): L line
+    segments, each (start_xy, end_xy) in the ego/LiDAR frame (meters); defaults to
+    the ``bev_rows`` key written by the SDG converter - but instead of drawing a
+    mask it emits the segments as normalised polylines for set-prediction training:
+
+        data["gt_lines"] -> float32 (L, num_points, 2), xy in [0, 1] over the
+                            (xbound, ybound) BEV extent, ordered start->end.
+
+    It applies ``lidar_aug_matrix`` (lidar -> augmented network frame) exactly like
+    the seg loader, so the line GT stays aligned with the augmented points/boxes,
+    and must sit at the same pipeline position (after GlobalRotScaleTrans). It is a
+    pure function of the saved geometry - no randomness - so the GT is deterministic
+    per sample.
+
+    ``num_points`` >= 2 resamples each (straight) segment by linear interpolation;
+    the default of 2 matches the stored endpoints exactly.
+    """
+
+    def __init__(
+        self,
+        xbound: Tuple[float, float, float],
+        ybound: Tuple[float, float, float],
+        num_points: int = 2,
+        geometry_key: str = "bev_rows",
+    ) -> None:
+        super().__init__()
+        self.xbound = xbound
+        self.ybound = ybound
+        self.num_points = max(2, int(num_points))
+        self.geometry_key = geometry_key
+
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        aug = data.get("lidar_aug_matrix", np.eye(4, dtype=np.float32))
+        R2 = aug[:2, :2]
+        t2 = aug[:2, 3]
+
+        rows = data.get(self.geometry_key, None)
+        lines = []
+        if rows is not None and len(rows) > 0:
+            ts = np.linspace(0.0, 1.0, self.num_points, dtype=np.float32)
+            xspan = self.xbound[1] - self.xbound[0]
+            yspan = self.ybound[1] - self.ybound[0]
+            for seg in np.asarray(rows, dtype=np.float32):  # (2, 2): start, end
+                net = seg @ R2.T + t2                        # ego -> augmented frame
+                # resample start->end into num_points points
+                pts = net[0][None, :] * (1.0 - ts[:, None]) + net[1][None, :] * ts[:, None]
+                xn = (pts[:, 0] - self.xbound[0]) / xspan
+                yn = (pts[:, 1] - self.ybound[0]) / yspan
+                lines.append(np.stack([xn, yn], axis=1))
+
+        if len(lines) > 0:
+            data["gt_lines"] = np.asarray(lines, dtype=np.float32)
+        else:
+            data["gt_lines"] = np.zeros((0, self.num_points, 2), dtype=np.float32)
+        return data

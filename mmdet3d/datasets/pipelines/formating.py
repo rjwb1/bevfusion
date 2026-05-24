@@ -121,6 +121,10 @@ class DefaultFormatBundle3D:
                 results["gt_bboxes_3d"] = DC(results["gt_bboxes_3d"], cpu_only=True)
             else:
                 results["gt_bboxes_3d"] = DC(to_tensor(results["gt_bboxes_3d"]))
+        # gt_lines is ragged (variable #lines per sample); keep it as a per-sample
+        # list instead of stacking, so the line head can match each sample.
+        if "gt_lines" in results:
+            results["gt_lines"] = DC(to_tensor(results["gt_lines"]), stack=False)
         return results
 
 

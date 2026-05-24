@@ -137,9 +137,13 @@ class NuScenesDataset(Custom3DDataset):
         test_mode=False,
         eval_version="detection_cvpr_2019",
         use_valid_flag=False,
+        camera_types=None,
     ) -> None:
         self.load_interval = load_interval
         self.use_valid_flag = use_valid_flag
+        # Optional subset/ordering of cameras (e.g. a 4-cam robot rig). When
+        # None, every camera in the info file is used in its stored order.
+        self.camera_types = camera_types
         super().__init__(
             dataset_root=dataset_root,
             ann_file=ann_file,
@@ -238,7 +242,16 @@ class NuScenesDataset(Custom3DDataset):
             data["camera_intrinsics"] = []
             data["camera2lidar"] = []
 
-            for _, camera_info in info["cams"].items():
+            if self.camera_types is not None:
+                cam_items = [
+                    (t, info["cams"][t])
+                    for t in self.camera_types
+                    if t in info["cams"]
+                ]
+            else:
+                cam_items = list(info["cams"].items())
+
+            for _, camera_info in cam_items:
                 data["image_paths"].append(camera_info["data_path"])
 
                 # lidar to camera transform

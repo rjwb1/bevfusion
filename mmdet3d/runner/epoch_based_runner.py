@@ -8,7 +8,9 @@ class CustomEpochBasedRunner(EpochBasedRunner):
 
 
     def train(self, data_loader, **kwargs):
-        # update the schedule for data augmentation
+        # update the schedule for data augmentation. Some dataset wrappers
+        # (e.g. RepeatDataset/ConcatDataset) don't expose set_epoch; skip them.
         for dataset in self._dataset:
-            dataset.set_epoch(self.epoch)
+            if hasattr(dataset, "set_epoch"):
+                dataset.set_epoch(self.epoch)
         super().train(data_loader, **kwargs)

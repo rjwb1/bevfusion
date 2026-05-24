@@ -301,6 +301,8 @@ class BEVFusion(Base3DFusionModel):
                     losses = head.loss(gt_bboxes_3d, gt_labels_3d, pred_dict)
                 elif type == "map":
                     losses = head(feat, gt_masks_bev)
+                elif type == "line":
+                    losses = head(feat, kwargs.get("gt_lines"))
                 else:
                     raise ValueError(f"unsupported head: {type}")
                 for name, val in losses.items():
@@ -333,6 +335,18 @@ class BEVFusion(Base3DFusionModel):
                                 "gt_masks_bev": gt_masks_bev[k].cpu(),
                             }
                         )
+                elif type == "line":
+                    preds = head(feat)
+                    gt_lines = kwargs.get("gt_lines")
+                    for k in range(batch_size):
+                        outputs[k].update(
+                            {
+                                "line_scores": preds["line_scores"][k].cpu(),
+                                "line_points": preds["line_points"][k].cpu(),
+                            }
+                        )
+                        if gt_lines is not None:
+                            outputs[k]["gt_lines"] = gt_lines[k]
                 else:
                     raise ValueError(f"unsupported head: {type}")
             return outputs

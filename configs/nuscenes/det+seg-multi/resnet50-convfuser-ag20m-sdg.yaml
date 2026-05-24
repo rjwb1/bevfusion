@@ -1,0 +1,391 @@
+# Multi-decoder (object det + BEV map seg) config for a short-range
+# agricultural robot. Inherits decoders/heads/optimizer from
+# det+seg-multi/default.yaml and dataset/pipeline scaffolding from
+# nuscenes/default.yaml, then shrinks the BEV working area to a 40 m x 40 m
+# square (+/-20 m in x and y) centred on the robot.
+#
+# Geometry (everything stays integer and aligned across both branches):
+#   * point_cloud_range x/y = +/-20 m, voxel 0.05 m -> sparse_shape 800 x 800.
+#   * SparseEncoder downsamples /8 -> 100 x 100 LiDAR BEV.
+#   * Camera vtransform grid at 0.2 m (200 cells) then downsample 2 -> 100 x 100,
+#     so the camera and LiDAR BEV grids match before fusion.
+#   * Object head out_size_factor 8 -> grid_size 800/8 = 100, matching the BEV.
+#   * Map head input_scope spans +/-20 m (must equal point_cloud_range x/y);
+#     output_scope / LoadBEVSegmentation produce an 80 x 80 (0.5 m) seg target.
+#   * dbound capped at 32 m: a 20 m corner is ~28 m away, so this comfortably
+#     covers the grid while trimming depth bins vs the full-range model.
+#
+# SDG FINETUNE variant of resnet50-convfuser-ag20m.yaml. Same geometry/heads;
+# the differences are:
+#   * dataset: synthetic Isaac SDG data via NuScenesSDGDataset + the info pkls
+#     produced by saga_isaac/sdg_to_bevfusion.py (set dataset_root below).
+#   * object_classes: kept as the 10 nuScenes classes so the pretrained detection
+#     head loads; the SDG data only supplies "pedestrian" boxes.
+#   * map_classes: replaced with the 2 robot classes [rows, obstacles]; the BEV
+#     seg GT is rasterised from per-sample vector geometry by
+#     LoadBEVSegmentationFromGeometry (no nuScenes map API).
+#   * ObjectPaste removed (no GT database for synthetic data).
+# Run with: torchpack ... tools/train.py <this file> --load_from <pretrained.pth>
+# (the 2-channel map head will not load from a 6-class checkpoint - expected).
+
+dataset_type: NuScenesSDGDataset
+# CHANGE ME: root of the converted SDG dataset (holds nuscenes_infos_*.pkl).
+dataset_root: /home/rob/thorvald_ws/src/SagaIsaac/nuscenes_sdg/
+
+# Rows are now detected as vector lines by the `line` head (see model.heads.line
+# below); the map-seg head keeps only the amorphous "obstacles" class.
+map_classes:
+  - obstacles
+
+# Number of points per detected line. The SDG row geometry is stored as 2-point
+# segments, so 2 (endpoints) is exact; raise it for curved lines.
+line_num_points: 2
+
+voxel_size: [0.05, 0.05, 0.2]
+point_cloud_range: [-20.0, -20.0, -5.0, 20.0, 20.0, 3.0]
+
+# The 4 cameras exported by the SDG converter. Names must match the keys in
+# info["cams"]; unmatched names are silently dropped (see NuScenesDataset
+# .get_data_info), which is why only CAM_FRONT/CAM_BACK rendered before.
+camera_types:
+  - CAM_FRONT
+  - CAM_FRONT_LEFT
+  - CAM_FRONT_RIGHT
+  - CAM_BACK
+
+model:
+  encoders:
+    camera:
+      backbone:
+        type: ResNet
+        depth: 50
+        out_indices: [1, 2, 3]
+        init_cfg:
+          type: Pretrained
+          checkpoint: https://download.pytorch.org/models/resnet50-0676ba61.pth
+      neck:
+        type: GeneralizedLSSFPN
+        in_channels: [512, 1024, 2048]
+        out_channels: 256
+        start_level: 0
+        num_outs: 3
+        norm_cfg:
+          type: BN2d
+          requires_grad: true
+        act_cfg:
+          type: ReLU
+          inplace: true
+        upsample_cfg:
+          mode: bilinear
+          align_corners: false
+      vtransform:
+        type: DepthLSSTransform
+        in_channels: 256
+        out_channels: 80
+        image_size: ${image_size}
+        feature_size: ${[image_size[0] // 8, image_size[1] // 8]}
+        xbound: [-20.0, 20.0, 0.2]
+        ybound: [-20.0, 20.0, 0.2]
+        zbound: [-10.0, 10.0, 20.0]
+        dbound: [1.0, 32.0, 0.5]
+        downsample: 2
+    lidar:
+      voxelize:
+        max_num_points: 10
+        point_cloud_range: ${point_cloud_range}
+        voxel_size: ${voxel_size}
+        max_voxels: [40000, 60000]
+      backbone:
+        type: SparseEncoder
+        in_channels: 5
+        sparse_shape: [800, 800, 41]
+        output_channels: 128
+        order:
+          - conv
+          - norm
+          - act
+        encoder_channels:
+          - [16, 16, 32]
+          - [32, 32, 64]
+          - [64, 64, 128]
+          - [128, 128]
+        encoder_paddings:
+          - [0, 0, 1]
+          - [0, 0, 1]
+          - [0, 0, [1, 1, 0]]
+          - [0, 0]
+        block_type: basicblock
+  fuser:
+    type: ConvFuser
+    in_channels: [80, 256]
+    out_channels: 256
+
+  heads:
+    object:
+      train_cfg:
+        grid_size: [800, 800, 41]
+      test_cfg:
+        grid_size: [800, 800, 41]
+      bbox_coder:
+        post_center_range: [-23.0, -23.0, -10.0, 23.0, 23.0, 10.0]
+    map:
+      grid_transform:
+        # input_scope min/max must equal point_cloud_range x/y; step is unused.
+        input_scope: [[-20.0, 20.0, 0.4], [-20.0, 20.0, 0.4]]
+        output_scope: [[-20.0, 20.0, 0.5], [-20.0, 20.0, 0.5]]
+    # Vector line head for crop rows (DETR-style set prediction on the fused BEV
+    # feature). in_channels = decoder.line neck output (512), same as object/map.
+    line:
+      type: BEVLineHead
+      in_channels: 512
+      xbound: [-20.0, 20.0, 0.2]
+      ybound: [-20.0, 20.0, 0.2]
+      num_queries: 16
+      num_points: ${line_num_points}
+      d_model: 128
+      num_decoder_layers: 3
+
+  # Multi-decoder: every head needs its own decoder branch. Mirror the map/object
+  # decoders so the line head gets a 512-ch BEV feature from the fused tensor.
+  decoder:
+    line:
+      backbone:
+        type: SECOND
+        in_channels: 256
+        out_channels: [128, 256]
+        layer_nums: [5, 5]
+        layer_strides: [1, 2]
+        norm_cfg:
+          type: BN
+          eps: 1.0e-3
+          momentum: 0.01
+        conv_cfg:
+          type: Conv2d
+          bias: false
+      neck:
+        type: SECONDFPN
+        in_channels: [128, 256]
+        out_channels: [256, 256]
+        upsample_strides: [1, 2]
+        norm_cfg:
+          type: BN
+          eps: 1.0e-3
+          momentum: 0.01
+        upsample_cfg:
+          type: deconv
+          bias: false
+        use_conv_for_no_stride: true
+
+  # Re-declared because the model indexes loss_scale[head]; default.yaml only lists
+  # object/map, so the new line head needs an entry here.
+  loss_scale:
+    object: 1.0
+    map: 5.0
+    line: 1.0
+
+# Pipelines redefined only to align the BEV-seg GT range with the map head's
+# output_scope (+/-20 m, 0.5 m -> 80 x 80). Everything else mirrors
+# nuscenes/default.yaml.
+train_pipeline:
+  -
+    type: LoadMultiViewImageFromFiles
+    to_float32: true
+  -
+    type: LoadPointsFromFile
+    coord_type: LIDAR
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    load_augmented: ${load_augmented}
+  -
+    type: LoadPointsFromMultiSweeps
+    sweeps_num: 9
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    pad_empty_sweeps: true
+    remove_close: true
+    load_augmented: ${load_augmented}
+  -
+    type: LoadAnnotations3D
+    with_bbox_3d: true
+    with_label_3d: true
+    with_attr_label: False
+  # ObjectPaste removed: synthetic data has no GT-database (nuscenes_dbinfos).
+  -
+    type: ImageAug3D
+    final_dim: ${image_size}
+    resize_lim: ${augment2d.resize[0]}
+    bot_pct_lim: [0.0, 0.0]
+    rot_lim: ${augment2d.rotate}
+    rand_flip: true
+    is_train: true
+  -
+    type: GlobalRotScaleTrans
+    resize_lim: ${augment3d.scale}
+    rot_lim: ${augment3d.rotate}
+    trans_lim: ${augment3d.translate}
+    is_train: true
+  -
+    type: LoadBEVSegmentationFromGeometry
+    xbound: [-20.0, 20.0, 0.5]
+    ybound: [-20.0, 20.0, 0.5]
+    classes: ${map_classes}
+    row_width: 0.4
+  -
+    type: RandomFlip3D
+  -
+    # After RandomFlip3D so lidar_aug_matrix already carries the flip; the loader
+    # transforms raw row geometry through it, keeping lines aligned with points.
+    type: LoadLinesFromGeometry
+    xbound: [-20.0, 20.0, 0.2]
+    ybound: [-20.0, 20.0, 0.2]
+    num_points: ${line_num_points}
+  -
+    type: PointsRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ObjectRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ObjectNameFilter
+    classes: ${object_classes}
+  -
+    type: ImageNormalize
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  -
+    type: GridMask
+    use_h: true
+    use_w: true
+    max_epoch: ${max_epochs}
+    rotate: 1
+    offset: false
+    ratio: 0.5
+    mode: 1
+    prob: ${augment2d.gridmask.prob}
+    fixed_prob: ${augment2d.gridmask.fixed_prob}
+  -
+    type: PointShuffle
+  -
+    type: DefaultFormatBundle3D
+    classes: ${object_classes}
+  -
+    type: Collect3D
+    keys:
+      - img
+      - points
+      - gt_bboxes_3d
+      - gt_labels_3d
+      - gt_masks_bev
+      - gt_lines
+    meta_keys:
+      - camera_intrinsics
+      - camera2ego
+      - lidar2ego
+      - lidar2camera
+      - camera2lidar
+      - lidar2image
+      - img_aug_matrix
+      - lidar_aug_matrix
+
+test_pipeline:
+  -
+    type: LoadMultiViewImageFromFiles
+    to_float32: true
+  -
+    type: LoadPointsFromFile
+    coord_type: LIDAR
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    load_augmented: ${load_augmented}
+  -
+    type: LoadPointsFromMultiSweeps
+    sweeps_num: 9
+    load_dim: ${load_dim}
+    use_dim: ${use_dim}
+    reduce_beams: ${reduce_beams}
+    pad_empty_sweeps: true
+    remove_close: true
+    load_augmented: ${load_augmented}
+  -
+    type: LoadAnnotations3D
+    with_bbox_3d: true
+    with_label_3d: true
+    with_attr_label: False
+  -
+    type: ImageAug3D
+    final_dim: ${image_size}
+    resize_lim: ${augment2d.resize[1]}
+    bot_pct_lim: [0.0, 0.0]
+    rot_lim: [0.0, 0.0]
+    rand_flip: false
+    is_train: false
+  -
+    type: GlobalRotScaleTrans
+    resize_lim: [1.0, 1.0]
+    rot_lim: [0.0, 0.0]
+    trans_lim: 0.0
+    is_train: false
+  -
+    type: LoadBEVSegmentationFromGeometry
+    xbound: [-20.0, 20.0, 0.5]
+    ybound: [-20.0, 20.0, 0.5]
+    classes: ${map_classes}
+    row_width: 0.4
+  -
+    type: LoadLinesFromGeometry
+    xbound: [-20.0, 20.0, 0.2]
+    ybound: [-20.0, 20.0, 0.2]
+    num_points: ${line_num_points}
+  -
+    type: PointsRangeFilter
+    point_cloud_range: ${point_cloud_range}
+  -
+    type: ImageNormalize
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  -
+    type: DefaultFormatBundle3D
+    classes: ${object_classes}
+  -
+    type: Collect3D
+    keys:
+      - img
+      - points
+      - gt_bboxes_3d
+      - gt_labels_3d
+      - gt_masks_bev
+      - gt_lines
+    meta_keys:
+      - camera_intrinsics
+      - camera2ego
+      - lidar2ego
+      - lidar2camera
+      - camera2lidar
+      - lidar2image
+      - img_aug_matrix
+      - lidar_aug_matrix
+
+# Restrict every split to the 4-camera subset (merged onto the base data cfg).
+data:
+  train:
+    # Disable CBGS for synthetic data. The base nuscenes/default.yaml wraps train
+    # in CBGSDataset, which (a) divides by each object class's instance frequency
+    # -> ZeroDivisionError because SDG only supplies "pedestrian" boxes, and
+    # (b) drops any frame lacking an object class, discarding map-only frames
+    # needed for the seg branch. RepeatDataset(times=1) is an identity wrapper
+    # over the inherited `dataset` cfg: no resampling, no dropped frames.
+    type: RepeatDataset
+    times: 1
+    dataset:
+      camera_types: ${camera_types}
+      # Keep boxes with zero LiDAR points (synthetic labels are reliable).
+      keep_zero_point_boxes: true
+  val:
+    camera_types: ${camera_types}
+    keep_zero_point_boxes: true
+  test:
+    camera_types: ${camera_types}
+    keep_zero_point_boxes: true

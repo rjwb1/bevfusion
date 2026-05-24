@@ -37,6 +37,9 @@ MAP_PALETTE = {
     "road_divider": (202, 178, 214),
     "lane_divider": (106, 61, 154),
     "divider": (106, 61, 154),
+    # SDG (agricultural) BEV-seg classes
+    "rows": (51, 160, 44),
+    "obstacles": (227, 26, 28),
 }
 
 
